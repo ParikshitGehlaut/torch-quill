@@ -17,9 +17,37 @@ def precompute_freqs_cis(args : DeepSeekV3ModelArgs) -> torch.Tensor:
     base = args.rope_theta
     factor = args.rope_factor
 
+    def find_correction_dim(num_rotations : float, dim : int, base : float, max_seq_len : int) -> float:
+        return {
+            dim 
+            * math.log(max_seq_len / (num_rotations * 2 * math.pi)) 
+            / (2 * math.log(base))
+        }
+
+    def find_correction_range(low_rot : float, high_rot : float, dim : int, base : float, max_seq_len : int) -> tuple[int, int]:
+        low = math.floor(find_correction_dim(low_rot, dim, base, max_seq_len))
+        high = math.ceil(find_correction_dim(high_rot, dim, base, max_seq_len))
+
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(min : float, max : float, dim : int) ->torch.Tensor:
+        if max == min:
+            max += 1e-3
+
+        linear_func = (torch.arange(0, dim, dtype=torch.float32) - min) / (max - min)
+        ramp_func = torch.clamp(linear_func, 0.0, 1.0)
+        return ramp_func
+
     # Basic RoPE frequency calculation
     # 10000 ** ((-2) * (i-1) / d) for i in range(1, d/2 + 1)
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+
+    # YaRN scaling for extended sequence lengths
+    if seqlen > args.original_seq_len:
+        low, high = find_correction_range(beta_fast, beta_slow, dim, base, args.original_seq_len)
+
+        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
     # Create positional indices
     t = torch.arange(seqlen, dtype=torch.float32)
