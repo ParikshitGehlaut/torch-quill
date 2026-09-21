@@ -108,7 +108,7 @@ class Attention(nn.Module):
         attn_output = self.inner_attention(q, k, v, scale = self.softmax_scale)
 
         # Reshape and project back to original dimension
-        attn_output = attn_output.transpose(1, 2).contiguous().
+        attn_output = attn_output.transpose(1, 2).contiguous()
 
         # merge all the heads as usual
         # attn_output : [batch_size, seq_len, n_heads * v_head_dim]
@@ -116,6 +116,160 @@ class Attention(nn.Module):
 
         # Apply the output projection
         return self.wo(attn_output)
+
+    @torch.no_grad()
+    def absorb_mla_weights(self) -> None:
+        if self.q_lora_rank != 0:
+            raise NotImplementedError
+
+        n_heads = self.n_heads
+        dim = self.dim
+        qk_nope_head_dim = self.qk_nope_head_dim
+        qk_rope_head_dim = self.qk_rope_head_dim
+        v_head_dim = self.v_head_dim
+        kv_lora_rank = self.kv_lora_rank
+
+        device = self.wq.weight.device
+        dtype = self.wq.weight.dtype
+        
+        # [dim, n_heads * (qk_nope_head_dim + v_head_dim)] --> [n_heads, qk_nope_head_dim + v_head_dim, dim]
+        wq = self.wq.weight.view(
+            n_heads,
+            qk_nope_head_dim + qk_rope_head_dim,
+            dim
+        )
+
+        # wq_nope : [n_heads, qk_nope_head_dim, dim]
+        # wq_rope : [n_heads, qk_rope_head_dim, dim]
+        wq_nope, wq_rope = torch.split(
+            wq,
+            [qk_nope_head_dim, qk_rope_head_dim],
+            dim=1
+        )
+
+        wkv_b = self.wkv_b.weight.view(
+            n_heads,
+            qk_nope_head_dim + v_head_dim,
+            kv_lora_rank
+        )
+
+        # w_uk : [n_heads, qk_nope_head_dim, kv_lora_rank]
+        # w_uv : [n_heads, v_head_dim, kv_lora_rank]
+        w_uk, w_uv = torch.split(
+            wkv_b,
+            [qk_nope_head_dim, v_head_dim],
+            dim=1
+        )
+
+        # We are interseted in wq_nope and w_uk, which are the weights for the up linear projections of q and k without RoPE.
+        # Our Absorption formula is : [w_uk]_T @ wq_nope
+        # [n_heads, kv_lora_rank, qk_nope_head_dim] @ [n_heads, qk_nope_head_dim, dim] --> [n_heads, kv_lora_rank, dim]
+        wq_abs_nope = torch.bmm(
+            w_uk.float().transpose(1, 2), # [n_heads, qk_nope_head_dim, kv_lora_rank] --> [n_heads, kv_lora_rank, qk_nope_head_dim]
+            wq_nope.float() # [n_heads, qk_nope_head_dim, dim]
+        ).to(dtype=dtype)
+
+        # Each query head is [absorbed nope : original RoPE]
+        wq_abs = torch.cat(
+            [wq_abs_nope, wq_rope], dim=1
+        ).reshape(
+            n_heads * (kv_lora_rank + qk_rope_head_dim), dim
+        )
+
+        self.wq_abs = nn.Linear(
+            dim, 
+            n_heads * (kv_lora_rank + qk_rope_head_dim),
+            bias=False,
+            device=device,
+            dtype=dtype
+        )
+
+        self.wq_abs.weight.copy_(wq_abs)
+        self.wq_abs.requires_grad_(False)
+
+        # Now, another absorption of wo and w_uv
+        # wo : [dim, n_heads * v_head_dim] --> [dim, n_heads, v_head_dim]
+        w_o = self.wo.weight.view(
+            dim, 
+            n_heads,
+            v_head_dim
+        ).permute(1, 0, 2)
+
+        # w_uv : [n_heads, v_head_dim, kv_lora_rank]
+        # [n_heads, dim, v_head_dim] @ [n_heads, v_head_dim, kv_lora_rank] --> [n_heads, dim, kv_lora_rank]
+        w_o_abs_per_head = torch.bmm(
+            w_o.float(), # [n_heads, dim, v_head_dim]
+            w_uv.float() # [n_heads, v_head_dim, kv_lora_rank]
+        ).to(dtype=dtype)
+
+
+        w_o_abs = w_o_abs_per_head.permute(1, 0, 2).reshape(dim, n_heads * kv_lora_rank)
+        self.wo_abs = nn.Linear(
+            dim,
+            n_heads * kv_lora_rank,
+            bias=False,
+            device=device,
+            dtype=dtype
+        )
+        self.wo_abs.weight.copy_(w_o_abs)
+        self.wo_abs.requires_grad_(False)
+
+    def forward_absorbed(self, x : torch.Tensor, freqs_cis : torch.Tensor) -> torch.Tensor:
+        assert self.wq_abs is not None, "wq_abs is not initialized. Call absorb_mla_weights() first."
+        assert self.wo_abs is not None, "wo_abs is not initialized. Call absorb_mla_weights() first."
+
+        batch_size, seq_len, _ = x.size()
+
+        # Query Projection
+        q = self.wq_abs(x) # (batch_size, seq_len, self.n_heads * (kv_lora_rank + qk_rope_head_dim))
+
+        # First visualise it as [batch_size, seq_len, n_heads, kv_lora_rank + qk_rope_head_dim]
+        q = q.view(batch_size, seq_len, self.n_heads, self.kv_lora_rank + self.qk_rope_head_dim)
+        # Split into q_nope and q_pe
+        q_nope, q_pe = torch.split(
+            q, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+
+        # Apply RoPE to q_pe
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        # Concatenate q_nope and q_pe back together
+        q = torch.cat([q_nope, q_pe], dim=-1)
+
+        # latent_raw : [batch_size, seq_len, kv_lora_rank]
+        # k_rope : [batch_size, seq_len, qk_rope_head_dim]
+        latent_raw, k_rope = torch.split(
+            self.wkv_a(x),
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1
+        )
+
+        # This latent that should be cached
+        # latent : [batch_size, seq_len, kv_lora_rank]
+        latent = self.kv_norm(latent_raw)
+
+        # k_rope : [batch_size, seq_len, qk_rope_head_dim] --> [batch_size, seq_len, 1, qk_rope_head_dim]
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(-2), freqs_cis)
+
+        # A single shared storage tensor
+        # shared cache : [batch_size, seq_len, 1, kv_lora_rank + qk_rope_head_dim] --> [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        shared_cache = torch.cat(
+            [latent.unsqueeze(-2), k_rope], dim=-1
+        ).transpose(1, 2)
+
+        # k : [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        k = shared_cache
+
+        # v : [batch_size, 1, seq_len, kv_lora_rank]
+        v = shared_cache[..., :self.kv_lora_rank]
+
+        # latent_output : [batch_size, n_heads, seq_len, kv_lora_rank]
+        latent_output = self.inner_attention(q, k, v, scale=self.softmax_scale)
+
+        latent_output = (
+            latent_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.n_heads * self.kv_lora_rank)
+        )
+
+        return self.wo_abs(latent_output)
 
 class TransformerBlock(nn.Module):
     """
@@ -218,10 +372,3 @@ class DeepSeekV3Model(nn.Module):
         h = self.norm(h)
         output = self.output(h)
         return output
-
-            
-        
-
-            
-        
-           
